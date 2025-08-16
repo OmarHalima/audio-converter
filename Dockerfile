@@ -1,18 +1,21 @@
+# Use official Python image
 FROM python:3.10-slim
 
+# Install ffmpeg and wget
+RUN apt-get update && apt-get install -y ffmpeg wget && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
 WORKDIR /app
 
-# Install system dependencies (ffmpeg + build tools)
-RUN apt-get update && apt-get install -y ffmpeg gcc libffi-dev && rm -rf /var/lib/apt/lists/*
-
-# Copy app
-COPY . .
+# Copy project files
+COPY requirements.txt .
+COPY app.py .
 
 # Install Python dependencies
-RUN pip install --no-cache-dir flask gunicorn pydub requests
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Expose port 8080 (not 5001!)
-EXPOSE 8080
+# Expose the internal port Flask/Gunicorn will use
+EXPOSE 5001
 
-# Start Gunicorn on port 8080
-CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:8080", "api:app"]
+# Run the app with Gunicorn
+CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:5001", "app:app"]
