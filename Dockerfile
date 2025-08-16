@@ -1,26 +1,27 @@
 # Dockerfile
-FROM python:3.10-slim
+FROM python:3.11-slim
 
-# Install system deps (ffmpeg + wget). Keep image small.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install ffmpeg and required OS packages
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     ffmpeg \
-    wget \
-    && rm -rf /var/lib/apt/lists/*
+    build-essential \
+  && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# Create app dir
 WORKDIR /app
 
-# Copy python deps and install them
+# Copy files
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app code
-COPY app.py .
+COPY . .
 
-# Create folders (redundant with app, but nice to ensure permissions)
-RUN mkdir -p /app/uploads /app/converted
+# Expose internal port
+EXPOSE 5001
 
-# Expose the port EasyPanel expects (8080)
-EXPOSE 8080
+# Create a non-root user (optional but recommended)
+RUN useradd -m -s /bin/bash appuser && chown -R appuser:appuser /app
+USER appuser
 
-# Use Gunicorn to run the app: module is app.py, Flask instance is `app`
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "app:app", "--workers", "4", "--timeout", "120"]
+# Use gunicorn for production
+CMD ["gunicorn", "-w", "3", "-b", "0.0.0.0:5001", "app:app"]

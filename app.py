@@ -1,92 +1,83 @@
 # app.py
-from flask import Flask, request, jsonify, send_file, abort
-import os
-import uuid
+from flask import Flask, request, jsonify, send_file
 import subprocess
-import shutil
+import os
+import requests
+import uuid
+import tempfile
 
 app = Flask(__name__)
 
-BASE_DIR = "/app"
-UPLOADS = os.path.join(BASE_DIR, "uploads")
-CONVERTED = os.path.join(BASE_DIR, "converted")
+OUTPUT_DIR = "/app/converted"   # inside container path
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-os.makedirs(UPLOADS, exist_ok=True)
-os.makedirs(CONVERTED, exist_ok=True)
-
-@app.route("/")
-def home():
-    return jsonify({"message": "Audio Converter API (EasyPanel) is running!"})
+MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024  # 200 MB cap
+REQUEST_TIMEOUT = (5, 60)  # connect timeout 5s, read timeout 60s
 
 @app.route("/convert", methods=["POST"])
 def convert():
-    """
-    POST JSON:
-    { "url": "<public file url>", "format": "mp3"|"ogg" } 
-    Returns JSON: { "download_url": "/download/<filename>" }
-    """
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"error": "expected JSON body"}), 400
+    data = request.json
+    if not data or "url" not in data or "format" not in data:
+        return jsonify({"error": "Missing 'url' or 'format'"}), 400
 
-    url = data.get("url")
-    out_fmt = (data.get("format") or "mp3").lower()
-    if not url:
-        return jsonify({"error": "missing 'url'"}), 400
-    if out_fmt not in ("mp3", "ogg"):
-        return jsonify({"error": "format must be 'mp3' or 'ogg'"}), 400
+    url = data["url"]
+    output_format = data["format"].lower()
 
-    uid = uuid.uuid4().hex
-    input_path = os.path.join(UPLOADS, f"{uid}.input")
-    output_name = f"{uid}.{out_fmt}"
-    output_path = os.path.join(CONVERTED, output_name)
+    if output_format not in ("mp3", "ogg"):
+        return jsonify({"error": "format must be mp3 or ogg"}), 400
 
-    try:
-        # Download input file with wget (works in many base images)
-        cmd_dl = ["wget", "-q", "-O", input_path, url]
-        subprocess.run(cmd_dl, check=True)
-
-        # Convert using ffmpeg (strip video if any, set reasonable audio params)
-        cmd_ff = [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", input_path,
-            "-vn",                        # no video
-            "-ar", "44100",               # sample rate
-            "-ac", "2",                   # channels
-            "-b:a", "192k",               # bitrate
-            output_path
-        ]
-        subprocess.run(cmd_ff, check=True)
-
-        # Optionally remove input to save space
+    # Download input file safely
+    with tempfile.NamedTemporaryFile(suffix=".in", delete=False) as tmp:
+        input_file = tmp.name
         try:
-            os.remove(input_path)
-        except OSError:
-            pass
+            with requests.get(url, stream=True, timeout=REQUEST_TIMEOUT) as r:
+                if r.status_code != 200:
+                    return jsonify({"error": "Failed to download file"}), 400
 
-        # Return a path the user (or n8n) can download from (reverse-proxied by EasyPanel)
-        download_url = f"/download/{output_name}"
-        return jsonify({"download_url": download_url}), 200
+                # Basic content-type check (video/audio)
+                ct = r.headers.get("content-type", "")
+                if not (ct.startswith("video") or ct.startswith("audio") or "octet-stream" in ct):
+                    # not definitive, but helps block some wrong URLs
+                    return jsonify({"error": f"Unexpected content-type: {ct}"}), 400
 
-    except subprocess.CalledProcessError as e:
-        # cleanup on failure
-        if os.path.exists(input_path):
-            os.remove(input_path)
-        if os.path.exists(output_path):
-            os.remove(output_path)
-        return jsonify({"error": "processing failed", "details": str(e)}), 500
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+                total = 0
+                for chunk in r.iter_content(chunk_size=8192):
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_DOWNLOAD_BYTES:
+                        return jsonify({"error": "File too large"}), 413
+                    tmp.write(chunk)
+        except requests.RequestException as e:
+            return jsonify({"error": f"Download error: {str(e)}"}), 400
+
+    # Convert with ffmpeg (add timeout)
+    output_name = f"{uuid.uuid4()}.{output_format}"
+    output_file = os.path.join(OUTPUT_DIR, output_name)
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", input_file, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k", output_file],
+            check=True,
+            timeout=120  # kill ffmpeg if it runs too long
+        )
+    except subprocess.TimeoutExpired:
+        os.remove(input_file)
+        return jsonify({"error": "Conversion timeout"}), 504
+    except subprocess.CalledProcessError:
+        os.remove(input_file)
+        return jsonify({"error": "Conversion failed"}), 500
+    finally:
+        if os.path.exists(input_file):
+            os.remove(input_file)
+
+    return jsonify({"output": f"http://{request.host}/download/{output_name}"})
 
 @app.route("/download/<filename>", methods=["GET"])
 def download(filename):
-    safe_name = os.path.basename(filename)
-    path = os.path.join(CONVERTED, safe_name)
-    if not os.path.exists(path):
-        abort(404)
-    # serve file as attachment
-    return send_file(path, as_attachment=True)
+    file_path = os.path.join(OUTPUT_DIR, filename)
+    if not os.path.exists(file_path):
+        return jsonify({"error": "File not found"}), 404
+    return send_file(file_path, as_attachment=True)
 
 if __name__ == "__main__":
-    # debug only; EasyPanel uses gunicorn
-    app.run(host="0.0.0.0", port=8080)
+    app.run(host="0.0.0.0", port=5001)
