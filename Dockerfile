@@ -1,20 +1,18 @@
-# Use lightweight Python
-FROM python:3.12-slim
+FROM python:3.10-slim
 
-# Set working directory
 WORKDIR /app
 
-# Copy dependencies first
-COPY requirements.txt .
+# Install system dependencies (ffmpeg + build tools)
+RUN apt-get update && apt-get install -y ffmpeg gcc libffi-dev && rm -rf /var/lib/apt/lists/*
 
-# Install dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy all project files
+# Copy app
 COPY . .
 
-# Expose Flask port
-EXPOSE 5001
+# Install Python dependencies
+RUN pip install --no-cache-dir flask gunicorn pydub requests
 
-# Run Gunicorn
-CMD ["gunicorn", "--bind", "0.0.0.0:5001", "app:app", "--workers", "4", "--threads", "2", "--timeout", "120"]
+# Expose port 8080 (not 5001!)
+EXPOSE 8080
+
+# Start Gunicorn on port 8080
+CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:8080", "api:app"]
